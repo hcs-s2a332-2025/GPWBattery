@@ -272,9 +272,11 @@ SW_ID = 0x01
 
 FEATURE_ROOT = 0x0000
 FEATURE_DEVICE_NAME = 0x0005
+FEATURE_UNIFIED_BATTERY = 0x1004
 FEATURE_BATTERY_LEVEL_STATUS = 0x1000
 FEATURE_BATTERY_VOLTAGE = 0x1001
-FEATURE_UNIFIED_BATTERY = 0x1004
+DEVICE_TYPE_MOUSE = 0x03
+TARGET_MOUSE_NAMES = ("PRO X Wireless", "G PRO X SUPERLIGHT", "PRO X SUPERLIGHT")
 
 # 电量状态
 STATUS_DISCHARGING = 0
@@ -350,12 +352,14 @@ class HidppDevice:
                 continue
             # 错误响应：[rid, devIdx, 0x8F, featureIdx, funcSwid, errorCode, ...]
             if resp[2] == 0x8F:
+                if len(resp) < 5 or resp[3] != feat_idx or resp[4] != pkt[3]:
+                    continue
                 code = resp[5] if len(resp) > 5 else None
                 raise HidppError(f"设备返回错误 0x{code:02X}" if code is not None
                                  else "设备返回错误", code=code)
             if resp[2] != feat_idx:
                 continue
-            if (resp[3] & 0x0F) != SW_ID:
+            if resp[3] != pkt[3]:
                 continue
             return resp
         raise HidppError("等待响应超时")
@@ -395,22 +399,30 @@ class HidppDevice:
         except Exception:
             return False
 
-    def read_name(self):
-        """feature 0x0005 DEVICE_NAME"""
+    def read_identity(self):
+        """Read the device type and complete name from HID++ feature 0x0005."""
+        idx = self.get_feature(FEATURE_DEVICE_NAME)
+        type_resp = self._send(idx, 0x2)
+        length_resp = self._send(idx, 0x0)
+        if len(type_resp) < 5 or len(length_resp) < 5:
+            raise HidppError("デバイス識別情報の応答が短すぎます")
+        length = length_resp[4]
+        if not 0 < length <= 40:
+            raise HidppError("デバイス名の長さが不正です")
+        name = bytearray()
+        while len(name) < length:
+            resp = self._send(idx, 0x1, bytes([len(name)]))
+            chunk = resp[4:4 + length - len(name)]
+            if not chunk:
+                raise HidppError("デバイス名の応答が短すぎます")
+            name.extend(chunk)
         try:
-            idx = self.get_feature(FEATURE_DEVICE_NAME)
-        except Exception:
-            return None
-        try:
-            resp = self._send(idx, 0x0, bytes([0x00]))
-            length = resp[4]
-            if length == 0 or length > 40:
-                return None
-            text = resp[5:5 + length]
-            name = text.decode("utf-8", "ignore").strip("\x00").strip()
-            return name or None
-        except Exception:
-            return None
+            text = name.decode("utf-8").strip("\x00").strip()
+        except UnicodeDecodeError as e:
+            raise HidppError("デバイス名を解読できません") from e
+        if not text:
+            raise HidppError("デバイス名が空です")
+        return type_resp[4], text
 
     # 设备不存在/不支持时，不必再试其它 feature
     ABSENT_CODES = (0x08, 0x09)
@@ -419,7 +431,38 @@ class HidppDevice:
         """返回 (percent, status, voltage_mv, source)"""
         errors = []
 
-        # 1) 0x1000 BATTERY_LEVEL_STATUS
+        # 1) 0x1004 UNIFIED_BATTERY
+        try:
+            idx = self.get_feature(FEATURE_UNIFIED_BATTERY)
+            capabilities = self._send(idx, 0x0, b"")
+            if len(capabilities) < 6:
+                raise HidppError("電池機能の応答が短すぎます")
+            if capabilities[5] & 0x02:
+                resp = self._send(idx, 0x1, b"")
+                if len(resp) < 7:
+                    raise HidppError("電池残量の応答が短すぎます")
+                level = resp[4]
+                battery_status = resp[6]
+                status = {
+                    0: STATUS_DISCHARGING,
+                    1: STATUS_CHARGING,
+                    2: STATUS_CHARGING,
+                    3: STATUS_CHARGE_COMPLETE,
+                    4: STATUS_CHARGING_SLOW,
+                }.get(battery_status, STATUS_INVALID)
+                if 0 <= level <= 100:
+                    return level, status, 0, "0x1004"
+                errors.append(f"0x1004 電池残量が範囲外です({level})")
+            else:
+                errors.append("0x1004: このデバイスは残量パーセントを取得できません")
+        except HidppError as e:
+            if e.code in self.ABSENT_CODES:
+                raise
+            errors.append(f"0x1004: {e}")
+        except Exception as e:
+            errors.append(f"0x1004: {e}")
+
+        # 2) 0x1000 BATTERY_LEVEL_STATUS
         try:
             idx = self.get_feature(FEATURE_BATTERY_LEVEL_STATUS)
             resp = self._send(idx, 0x0, b"")
@@ -428,7 +471,7 @@ class HidppDevice:
             volt = (resp[6] << 8 | resp[7]) if len(resp) > 7 else 0
             if 0 < level <= 100:
                 return level, status, volt, "0x1000"
-            errors.append(f"0x1000 电量无效({level})")
+            errors.append(f"0x1000 電池残量が範囲外です({level})")
         except HidppError as e:
             if e.code in self.ABSENT_CODES:
                 raise
@@ -436,14 +479,14 @@ class HidppDevice:
         except Exception as e:
             errors.append(f"0x1000: {e}")
 
-        # 2) 0x1001 BATTERY_VOLTAGE
+        # 3) 0x1001 BATTERY_VOLTAGE
         try:
             idx = self.get_feature(FEATURE_BATTERY_VOLTAGE)
             resp = self._send(idx, 0x0, b"")
             volt = (resp[4] << 8) | resp[5]
             if 3000 <= volt <= 4500:
                 return voltage_to_percent(volt), STATUS_INVALID, volt, "0x1001"
-            errors.append(f"0x1001 电压异常({volt})")
+            errors.append(f"0x1001 電圧が範囲外です({volt})")
         except HidppError as e:
             if e.code in self.ABSENT_CODES:
                 raise
@@ -451,7 +494,7 @@ class HidppDevice:
         except Exception as e:
             errors.append(f"0x1001: {e}")
 
-        # 3) HID++ 1.0 register 0x07
+        # 4) HID++ 1.0 register 0x07
         try:
             level = self._read_battery_hidpp10()
             if level is not None:
@@ -459,7 +502,7 @@ class HidppDevice:
         except Exception as e:
             errors.append(f"1.0/0x07: {e}")
 
-        raise HidppError("; ".join(errors) or "读取电量失败")
+        raise HidppError("; ".join(errors) or "電池残量を読み取れませんでした")
 
     def _read_battery_hidpp10(self):
         """老协议：register 0x07。返回百分比或 None。"""
@@ -541,16 +584,16 @@ class BatteryReading:
     @property
     def status_text(self):
         if self.error:
-            return "未连接"
+            return "未接続"
         if self.status == STATUS_CHARGING:
             return "充电中"
         if self.status == STATUS_CHARGING_SLOW:
-            return "缓慢充电"
+            return "低速充電中"
         if self.status == STATUS_CHARGE_COMPLETE:
-            return "已充满"
+            return "充電完了"
         if self.percent is not None:
             return "使用中"
-        return "未知"
+        return "不明"
 
     def __repr__(self):
         return (f"BatteryReading(percent={self.percent}, status={self.status}, "
@@ -615,19 +658,21 @@ def _channel_responds(info, timeout_ms=900):
 
 def read_battery(preferred_name=None, verbose=False, budget=6.0):
     """
-    探测所有 HID++ 通道，返回第一个成功读到的 BatteryReading。
+    探测 HID++ 通道，仅返回已确认目标鼠标的 BatteryReading。
     失败时返回带 error 的 BatteryReading。
     budget: 整体探测时间上限（秒），避免鼠标离线时长时间阻塞。
     """
     deadline = time.time() + budget
     channels = _hidpp_channels()
     if not channels:
-        return BatteryReading(error="未找到罗技接收器（请确认接收器已插好）")
+        return BatteryReading(error="Logicoolのレシーバーが見つかりません。接続を確認してください")
 
     receiver_answered = False
     device_asleep = False
     errors = []
     any_channel_alive = False
+    target_names = (preferred_name,) if preferred_name else TARGET_MOUSE_NAMES
+    target_names = {name.casefold() for name in target_names}
     for info in channels:
         if time.time() > deadline:
             break
@@ -642,11 +687,12 @@ def read_battery(preferred_name=None, verbose=False, budget=6.0):
             dev = None
             try:
                 dev = HidppDevice(info, receiver=info["receiver"], device_index=dev_idx)
+                device_type, name = dev.read_identity()
+                if device_type != DEVICE_TYPE_MOUSE or name.casefold() not in target_names:
+                    if verbose:
+                        print(f"[--] {name} idx={dev_idx:#04x} type={device_type:#04x} 対象外")
+                    continue
                 percent, status, volt, source = dev.read_battery()
-                name = dev.read_name()
-                if not name:
-                    # 接收器通道上通常读不到型号名（需要长报文），用默认名
-                    name = "GPW1" if info["receiver"] else KNOWN_PIDS.get(info["pid"], "GPW1")
                 transport = "接收器" if info["receiver"] else "直连"
                 reading = BatteryReading(
                     percent=percent, status=status, voltage=volt,
@@ -676,15 +722,15 @@ def read_battery(preferred_name=None, verbose=False, budget=6.0):
                     dev.handle.close()
 
     if device_asleep:
-        return BatteryReading(error="鼠标休眠中（移动一下鼠标唤醒）", state="asleep")
+        return BatteryReading(error="マウスはスリープ中です（マウスを動かして起動してください）", state="asleep")
     if receiver_answered:
-        msg = "未检测到鼠标（请确认已配对/已开机）"
+        msg = "マウスが見つかりません（電源とペアリングを確認してください）"
         state = "absent"
     elif not any_channel_alive:
         msg = "接收器无响应（请重新插拔接收器）"
         state = "no_receiver"
     else:
-        msg = "未检测到罗技鼠标"
+        msg = "Logicoolマウスが見つかりません"
         state = "absent"
     if errors:
         msg += f"｜{errors[-1]}"
@@ -696,7 +742,7 @@ if __name__ == "__main__":
     r = read_battery(verbose="-v" in sys.argv)
     print(r)
     if r.percent is not None:
-        print(f"电量：{r.percent}%  状态：{r.status_text}  "
-              f"电压：{r.voltage}mV  设备：{r.device_name}  链路：{r.transport}")
+        print(f"電池残量: {r.percent}%  状態: {r.status_text}  "
+              f"電圧: {r.voltage}mV  デバイス: {r.device_name}  接続: {r.transport}")
     else:
-        print("读取失败：", r.error)
+        print("読み取りに失敗しました:", r.error)

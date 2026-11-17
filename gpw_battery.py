@@ -29,7 +29,7 @@ from ctypes import wintypes
 import hidpp
 
 # ===================================================================== 常量
-APP_NAME = "GPW Battery"
+APP_NAME = "マウス電池残量"
 FONT_FACE = "Segoe UI"
 
 WM_DESTROY = 0x0002
@@ -70,6 +70,7 @@ NIM_SETVERSION = 0x00000004
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
+NIF_SHOWTIP = 0x00000080
 NOTIFYICON_VERSION_4 = 4
 
 ULW_ALPHA = 0x00000002
@@ -78,6 +79,7 @@ AC_SRC_ALPHA = 0x01
 DIB_RGB_COLORS = 0
 
 DT_LEFT = 0x0000
+DT_CENTER = 0x0001
 DT_SINGLELINE = 0x0020
 DT_NOPREFIX = 0x0800
 DT_CALCRECT = 0x0400
@@ -87,6 +89,7 @@ ANTIALIASED_QUALITY = 4
 DEFAULT_CHARSET = 1
 FW_NORMAL = 400
 FW_SEMIBOLD = 600
+FW_BOLD = 700
 
 SM_CXSMICON = 49
 MONITOR_DEFAULTTONEAREST = 2
@@ -311,7 +314,7 @@ def RGB(r, g, b):
 
 # ===================================================================== 图标绘制
 def make_battery_icon(percent, charging=False, size=None, connected=True):
-    """把电池图形画到位图里，返回 HICON（调用方负责 DestroyIcon）"""
+    """把百分比画到托盘图标里，返回 HICON（调用方负责 DestroyIcon）"""
     if size is None:
         size = max(16, user32.GetSystemMetrics(SM_CXSMICON))
     hdc_screen = user32.GetDC(None)
@@ -328,56 +331,55 @@ def make_battery_icon(percent, charging=False, size=None, connected=True):
                                  ctypes.byref(bits), None, 0)
     old = gdi32.SelectObject(mem_dc, hbm)
     try:
-        if not connected:
+        if not connected or percent is None:
             color = CLR_UNKNOWN
-            level = 0
-        elif charging:
-            color = CLR_CHARGE
-            level = percent if percent is not None else 0
+            text = "--"
         else:
-            p = percent or 0
-            color = CLR_OK if p > 50 else (CLR_MID if p > 20 else CLR_LOW)
-            level = p
+            level = max(0, min(100, int(percent)))
+            color = (CLR_CHARGE if charging else
+                     CLR_OK if level > 50 else CLR_MID if level > 20 else CLR_LOW)
+            text = str(level)
 
-        s = size / 32.0
+        font_height = max(6, int(round(size * (0.55 if len(text) <= 2 else 0.4))))
+        font = gdi32.CreateFontW(-font_height, 0, 0, 0, FW_BOLD, 0, 0, 0,
+                                 DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, FONT_FACE)
+        old_font = gdi32.SelectObject(mem_dc, font)
+        text_rect = wintypes.RECT(0, 0, 0, 0)
+        user32.DrawTextW(mem_dc, text, -1, ctypes.byref(text_rect),
+                         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT)
+        text_width = text_rect.right - text_rect.left
+        suffix = "%" if connected and percent is not None else ""
+        suffix_font = None
+        suffix_width = 0
+        if suffix:
+            suffix_font = gdi32.CreateFontW(-max(5, int(round(font_height * 0.6))),
+                                            0, 0, 0, FW_BOLD, 0, 0, 0,
+                                            DEFAULT_CHARSET, 0, 0,
+                                            ANTIALIASED_QUALITY, 0, FONT_FACE)
+            gdi32.SelectObject(mem_dc, suffix_font)
+            suffix_rect = wintypes.RECT(0, 0, 0, 0)
+            user32.DrawTextW(mem_dc, suffix, -1, ctypes.byref(suffix_rect),
+                             DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT)
+            suffix_width = suffix_rect.right - suffix_rect.left
+            gdi32.SelectObject(mem_dc, font)
 
-        def S(v):
-            return int(round(v * s))
-
-        # 32x32 设计稿坐标
-        BODY = (S(2), S(9), S(26), S(25))     # 电池外壳
-        NUB = (S(26), S(14), S(30), S(20))    # 正极触点
-        INNER = (S(5), S(12), S(23), S(22))   # 内部可填充区域
-
-        # 电池外壳（空心，深浅色任务栏都清晰）
-        pen = gdi32.CreatePen(0, max(1, S(2)), RGB(*color))
-        old_pen = gdi32.SelectObject(mem_dc, pen)
-        hollow = gdi32.GetStockObject(NULL_BRUSH)
-        old_brush = gdi32.SelectObject(mem_dc, hollow)
-        gdi32.RoundRect(mem_dc, BODY[0], BODY[1], BODY[2], BODY[3], S(3), S(3))
-
-        # 正极触点
-        brush = gdi32.CreateSolidBrush(RGB(*color))
-        gdi32.SelectObject(mem_dc, brush)
-        gdi32.RoundRect(mem_dc, NUB[0], NUB[1], NUB[2], NUB[3], S(2), S(2))
-
-        # 电量填充
-        if connected and level > 0:
-            inner_w = INNER[2] - INNER[0]
-            fill_w = max(1, int(round(inner_w * min(100, max(0, level)) / 100.0)))
-            gdi32.SelectObject(mem_dc, brush)
-            gdi32.RoundRect(mem_dc, INNER[0], INNER[1], INNER[0] + fill_w, INNER[3],
-                            S(2), S(2))
-        elif not connected:
-            # 断线：画一道斜杠
-            gdi32.SelectObject(mem_dc, pen)
-            gdi32.MoveToEx(mem_dc, S(6), S(21), None)
-            gdi32.LineTo(mem_dc, S(22), S(11))
-
-        gdi32.SelectObject(mem_dc, old_pen)
-        gdi32.SelectObject(mem_dc, old_brush)
-        gdi32.DeleteObject(brush)
-        gdi32.DeleteObject(pen)
+        text_x = max(0, (size - text_width - suffix_width) // 2)
+        gdi32.SetBkMode(mem_dc, TRANSPARENT)
+        gdi32.SetTextColor(mem_dc, RGB(*color))
+        rc = wintypes.RECT(text_x, 0, text_x + text_width, size)
+        user32.DrawTextW(mem_dc, text, -1, ctypes.byref(rc),
+                         DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER)
+        if suffix_font:
+            gdi32.SelectObject(mem_dc, suffix_font)
+            rc = wintypes.RECT(text_x + text_width, 0,
+                               text_x + text_width + suffix_width, size)
+            user32.DrawTextW(mem_dc, suffix, -1, ctypes.byref(rc),
+                             DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER)
+            gdi32.SelectObject(mem_dc, font)
+        gdi32.SelectObject(mem_dc, old_font)
+        gdi32.DeleteObject(font)
+        if suffix_font:
+            gdi32.DeleteObject(suffix_font)
         gdi32.GdiFlush()
 
         # 关键：GDI 不写 alpha 通道，把画过的像素 alpha 置为不透明
@@ -713,24 +715,24 @@ class Popup(LayeredCard):
     def describe(reading):
         """把一次电量读数翻译成 (标题, 副标题, 电量, 充电中, 已连接)"""
         if reading is None:
-            return ("GPW1", "正在读取…", None, False, True)
+            return ("G PRO X SUPERLIGHT", "電池残量を確認中…", None, False, True)
 
-        title = reading.device_name or "GPW1"
+        title = reading.device_name or "G PRO X SUPERLIGHT"
         if not reading.error:
             level = reading.percent
-            sub = (f"电量 {level}%  ·  {reading.status_text}"
-                   if level is not None else "电量未知")
+            sub = (f"電池残量 {level}%  ·  {reading.status_text}"
+                   if level is not None else "電池残量は不明です")
             return (title, sub, level, reading.charging, True)
 
         state = getattr(reading, "state", "")
         if state == "asleep":
-            sub = "鼠标休眠 · 移动鼠标唤醒"
+            sub = "マウスはスリープ中 · 動かすと復帰します"
         elif state == "no_receiver":
-            sub = "接收器无响应 · 请重新插拔"
-        elif state == "absent" or "未连接" in reading.error:
-            sub = "鼠标未连接 · 请打开电源"
+            sub = "レシーバーが応答しません · 抜き差ししてください"
+        elif state == "absent" or "未接続" in reading.error:
+            sub = "マウスが未接続です · 電源を確認してください"
         else:
-            sub = "未检测到设备"
+            sub = "対応デバイスが見つかりません"
         return (title, sub, None, False, False)
 
     def _metrics(self):
@@ -986,7 +988,6 @@ class App:
 
     ID_TRAY = 1
     ID_TIMER_WATCH = 1
-    ID_TIMER_REFRESH = 2
     WATCH_INTERVAL = 30       # 鼠标轮询间隔（毫秒）
     MENU_REFRESH = 1001
     MENU_AUTOSTART = 1002
@@ -1003,6 +1004,7 @@ class App:
         self._lock = threading.Lock()
         self._monitor = None
         self._stop = threading.Event()
+        self._refresh_requested = threading.Event()
         self._wndproc_ref = None
         self._icon_rect = wintypes.RECT(0, 0, 0, 0)
         self._icon_rect_time = 0.0
@@ -1010,7 +1012,6 @@ class App:
         self._lbtn_down = False
         self._rbtn_down = False
         self._menu_shown_at = 0.0
-        self._pending_refresh = False
         self._wm_taskbar_created = 0
         self._last_click_time = 0.0
         dpi = user32.GetDpiForSystem()
@@ -1045,8 +1046,6 @@ class App:
         self.menu = MenuPopup(self)
         self.menu.create()
         self._add_tray_icon()
-        user32.SetTimer(self.hwnd, self.ID_TIMER_WATCH, self.WATCH_INTERVAL, None)
-        user32.SetTimer(self.hwnd, self.ID_TIMER_REFRESH, 1000, None)
         self._start_monitor()
         return self
 
@@ -1056,10 +1055,18 @@ class App:
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd
         nid.uID = self.ID_TRAY
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
         nid.uCallbackMessage = WM_TRAY
         nid.hIcon = self.hicon
-        nid.szTip = ""  # 空提示：避免和自绘弹窗重复
+        reading = self.reading
+        if reading is None:
+            tip = "マウス電池残量を確認中"
+        elif reading.error:
+            tip = f"{reading.device_name or 'マウス'}: {reading.status_text}"
+        else:
+            tip = (f"{reading.device_name or 'マウス'}: "
+                   f"{reading.percent}% · {reading.status_text}")
+        nid.szTip = tip[:127]
         return nid
 
     def _add_tray_icon(self, attempts=24, delay=0.5):
@@ -1145,10 +1152,10 @@ class App:
     # -- 菜单 ------------------------------------------------------
     def _menu_items(self):
         return [
-            ("item", "刷新电量", self.MENU_REFRESH, False),
-            ("item", "开机自启动", self.MENU_AUTOSTART, self._autostart_enabled()),
+            ("item", "電池残量を更新", self.MENU_REFRESH, False),
+            ("item", "Windows起動時に起動", self.MENU_AUTOSTART, self._autostart_enabled()),
             ("sep", "", 0, False),
-            ("item", "退出", self.MENU_EXIT, False),
+            ("item", "終了", self.MENU_EXIT, False),
         ]
 
     def _anchor_rect(self):
@@ -1162,11 +1169,12 @@ class App:
         return wintypes.RECT(pt.x - size // 2, pt.y - size // 2,
                              pt.x + size // 2, pt.y + size // 2)
 
-    def _show_menu(self):
+    def _show_menu(self, anchor=None):
         # 右键菜单弹出时，左键弹窗必须让位
         self.popup.hide()
         self._menu_shown_at = time.time()
-        self.menu.show_at(self._anchor_rect(), self._menu_items(), self.dpi)
+        self.menu.show_at(anchor or self._anchor_rect(), self._menu_items(), self.dpi)
+        user32.SetTimer(self.hwnd, self.ID_TIMER_WATCH, self.WATCH_INTERVAL, None)
 
     def _on_menu_command(self, cmd):
         if cmd == self.MENU_REFRESH:
@@ -1215,7 +1223,7 @@ class App:
                     winreg.SetValueEx(k, self.RUN_VALUE, 0, winreg.REG_SZ,
                                       self._autostart_command())
         except Exception as e:
-            print("设置开机自启失败:", e, file=sys.stderr)
+            print("Windows起動時の自動起動を設定できませんでした:", e, file=sys.stderr)
 
     # -- 数据轮询 --------------------------------------------------
     # 鼠标休眠时接收器不响应，若上次数值还很新，就保留旧值，避免图标在
@@ -1240,39 +1248,32 @@ class App:
     def _start_monitor(self):
         def loop():
             while not self._stop.is_set():
+                self._refresh_requested.clear()
+                if self._stop.is_set():
+                    break
                 if self.demo:
-                    time.sleep(2)
+                    self._refresh_requested.wait(30)
                     continue
                 try:
                     r = hidpp.read_battery()
                 except Exception as e:
-                    r = hidpp.BatteryReading(error=f"读取异常: {e}")
+                    r = hidpp.BatteryReading(error=f"読み取りエラー: {e}")
                 self._store_reading(r)
                 if self.hwnd:
                     user32.PostMessageW(self.hwnd, WM_REFRESH_DONE, 0, 0)
+                if self._stop.is_set():
+                    break
                 # 已连接 30s 一读；未连接 8s 重试一次
-                self._stop.wait(30 if r.percent is not None else 8)
+                self._refresh_requested.wait(30 if r.percent is not None else 8)
 
         self._monitor = threading.Thread(target=loop, name="battery-monitor", daemon=True)
         self._monitor.start()
 
     def refresh(self):
         """立刻重新读一次（弹窗显示 / 手动刷新时用）"""
-        if self.demo or self._pending_refresh:
+        if self.demo:
             return
-        self._pending_refresh = True
-
-        def work():
-            try:
-                r = hidpp.read_battery()
-            except Exception as e:
-                r = hidpp.BatteryReading(error=f"读取异常: {e}")
-            self._store_reading(r)
-            self._pending_refresh = False
-            if self.hwnd:
-                user32.PostMessageW(self.hwnd, WM_REFRESH_DONE, 0, 0)
-
-        threading.Thread(target=work, daemon=True).start()
+        self._refresh_requested.set()
 
     # -- 点击 / 收起 ------------------------------------------------
     @staticmethod
@@ -1300,13 +1301,14 @@ class App:
         """
         if not self.hwnd:
             return
+        if not (self.popup.visible or self.menu.visible):
+            user32.KillTimer(self.hwnd, self.ID_TIMER_WATCH)
+            return
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         # 两个按键状态始终跟着刷新，避免弹窗出现时拿到过期的「上一次是否按住」
         l_pressed, self._lbtn_down = self._button_pressed(VK_LBUTTON, self._lbtn_down)
         r_pressed, self._rbtn_down = self._button_pressed(VK_RBUTTON, self._rbtn_down)
-        if not (self.popup.visible or self.menu.visible):
-            return
         if not (l_pressed or r_pressed):
             if self.menu.visible:
                 self.menu.sync_hover(pt)
@@ -1315,7 +1317,6 @@ class App:
         rc = self.icon_rect()
         over_icon = bool(rc) and not self._icon_fallback and \
             bool(user32.PtInRect(ctypes.byref(rc), pt))
-
         if l_pressed:
             if self.menu.visible and not self.menu.contains(pt):
                 self.menu.hide()
@@ -1323,7 +1324,7 @@ class App:
                 self.popup.hide()
 
         # 右键：弹窗上一律收起；菜单上只认菜单外面的右键。
-        # 菜单本身就是右键点出来的，那次按键要排除掉（over_icon + 刚弹出的时间窗）。
+        # 菜单本身就是右键点出来的，那次按键要排除掉（锚点 + 刚弹出的时间窗）。
         if r_pressed and not over_icon:
             if self.menu.visible:
                 if not self.menu.contains(pt) and \
@@ -1336,12 +1337,13 @@ class App:
         if self.menu.visible:
             self.menu.sync_hover(pt)
 
-    def _show_popup(self):
-        """左键弹出：锚点取托盘图标矩形，显示在图标正上方"""
+    def _show_popup(self, anchor=None):
+        """左键弹出：在通知图标上方显示详细信息"""
         with self._lock:
             reading = self.reading
         self.menu.hide()
-        self.popup.show_at(self._anchor_rect(), reading, self.dpi, align="center")
+        self.popup.show_at(anchor or self._anchor_rect(), reading, self.dpi, align="center")
+        user32.SetTimer(self.hwnd, self.ID_TIMER_WATCH, self.WATCH_INTERVAL, None)
         # 数据超过 10 秒则顺手刷新一次
         if not self.demo and (time.time() - self.last_ok_time > 10 or reading is None):
             self.refresh()
@@ -1392,12 +1394,6 @@ class App:
             if msg == WM_TIMER:
                 if wparam == self.ID_TIMER_WATCH:
                     self._on_watch_timer()
-                elif wparam == self.ID_TIMER_REFRESH:
-                    if self._pending_refresh is False and not self.demo:
-                        with self._lock:
-                            stale = (time.time() - self.last_ok_time > 30)
-                        if stale:
-                            self.refresh()
                 return 0
             if msg == WM_REFRESH_DONE:
                 self._update_icon()
@@ -1415,9 +1411,9 @@ class App:
 
     def quit(self):
         self._stop.set()
+        self._refresh_requested.set()
         if self.hwnd:
             user32.KillTimer(self.hwnd, self.ID_TIMER_WATCH)
-            user32.KillTimer(self.hwnd, self.ID_TIMER_REFRESH)
             self._remove_tray_icon()
             self.hwnd_destroyed = True
             user32.DestroyWindow(self.hwnd)
@@ -1469,10 +1465,10 @@ def main(argv):
     if "--once" in argv:
         r = hidpp.read_battery(verbose=True)
         if r.percent is not None:
-            print(f"{r.device_name}  电量 {r.percent}%  {r.status_text}  "
+            print(f"{r.device_name}  電池残量 {r.percent}%  {r.status_text}  "
                   f"({r.voltage}mV, {r.transport}, {r.source})")
             return 0
-        print("读取失败:", r.error)
+        print("読み取りに失敗しました:", r.error)
         return 1
 
     try:
